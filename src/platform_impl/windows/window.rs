@@ -35,13 +35,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMenu, GetSystemMetrics, GetWindowPlacement, GetWindowTextLengthW,
     GetWindowTextW, IsWindowVisible, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassExW,
     SetCursor, SetCursorPos, SetForegroundWindow, SetMenuDefaultItem, SetWindowDisplayAffinity,
-    SetWindowPlacement, SetWindowPos, SetWindowTextW, TrackPopupMenu, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, FLASHWINFO, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY,
-    GWLP_HINSTANCE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND, NID_READY,
-    PM_NOREMOVE, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SM_DIGITIZER,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN, TPM_RETURNCMD,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WNDCLASSEXW,
+    SetWindowPos, SetWindowTextW, TrackPopupMenu, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    FLASHWINFO, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY, GWLP_HINSTANCE, HTBOTTOM,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND, NID_READY, PM_NOREMOVE, SC_CLOSE,
+    SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SM_DIGITIZER, SWP_ASYNCWINDOWPOS,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN, TPM_RETURNCMD, WDA_EXCLUDEFROMCAPTURE,
+    WDA_NONE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WNDCLASSEXW,
 };
 
 use tracing::warn;
@@ -800,14 +800,19 @@ impl Window {
             // Update window bounds
             match &fullscreen {
                 Some(fullscreen) => {
-                    // Save window bounds before entering fullscreen
-                    let placement = unsafe {
-                        let mut placement = mem::zeroed();
-                        GetWindowPlacement(window, &mut placement);
-                        placement
-                    };
-
-                    window_state.lock().unwrap().saved_window = Some(SavedWindow { placement });
+                    // Save window bounds before entering fullscreen, unless a restore posted by
+                    // leaving fullscreen is still pending: those are the windowed bounds, while
+                    // the window still has its fullscreen bounds.
+                    let mut window_state_lock = window_state.lock().unwrap();
+                    if window_state_lock.saved_window.is_none() {
+                        let placement = unsafe {
+                            let mut placement = mem::zeroed();
+                            GetWindowPlacement(window, &mut placement);
+                            placement
+                        };
+                        window_state_lock.saved_window = Some(SavedWindow { placement });
+                    }
+                    drop(window_state_lock);
 
                     let monitor = match &fullscreen {
                         Fullscreen::Exclusive(video_mode) => video_mode.monitor(),
@@ -832,13 +837,13 @@ impl Window {
                     }
                 },
                 None => {
-                    let mut window_state_lock = window_state.lock().unwrap();
-                    if let Some(SavedWindow { placement }) = window_state_lock.saved_window.take() {
-                        drop(window_state_lock);
-                        unsafe {
-                            SetWindowPlacement(window, &placement);
-                            InvalidateRgn(window, 0, false.into());
-                        }
+                    // Move the window back in a later message, not in the one that restored its
+                    // style above. When the style and the bounds change within one message, a
+                    // transparent window stays opaque outside its drawn content afterwards (seen
+                    // with a Vulkan swapchain on NVIDIA); with the style restored first and the
+                    // bounds in a later message, it keeps its transparency.
+                    unsafe {
+                        PostMessageW(window, event_loop::RESTORE_WINDOWED_MSG_ID.get(), 0, 0);
                     }
                 },
             }

@@ -21,8 +21,9 @@ use windows_sys::Win32::Foundation::{
     GetLastError, FALSE, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
-    ValidateRect, MONITORINFO, MONITOR_DEFAULTTONULL, RDW_INTERNALPAINT, SC_SCREENSAVE,
+    GetMonitorInfoW, InvalidateRgn, MonitorFromRect, MonitorFromWindow, RedrawWindow,
+    ScreenToClient, ValidateRect, MONITORINFO, MONITOR_DEFAULTTONULL, RDW_INTERNALPAINT,
+    SC_SCREENSAVE,
 };
 use windows_sys::Win32::System::Ole::RevokeDragDrop;
 use windows_sys::Win32::System::Threading::{
@@ -45,13 +46,13 @@ use windows_sys::Win32::UI::Input::{RAWINPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetMenu, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
-    RegisterClassExW, RegisterWindowMessageA, SetCursor, SetWindowPos, TranslateMessage,
-    CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT,
-    MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, PT_PEN,
-    PT_TOUCH, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SC_MINIMIZE, SC_RESTORE,
-    SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WHEEL_DELTA, WINDOWPOS,
-    WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT,
-    WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
+    RegisterClassExW, RegisterWindowMessageA, SetCursor, SetWindowPlacement, SetWindowPos,
+    TranslateMessage, CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA,
+    HTCAPTION, HTCLIENT, MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS,
+    PM_REMOVE, PT_PEN, PT_TOUCH, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SC_MINIMIZE,
+    SC_RESTORE, SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WHEEL_DELTA,
+    WINDOWPOS, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP,
+    WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
     WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
     WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN,
     WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
@@ -81,7 +82,7 @@ use crate::platform_impl::platform::keyboard_layout::LAYOUT_CACHE;
 use crate::platform_impl::platform::monitor::{self, MonitorHandle};
 use crate::platform_impl::platform::window::InitData;
 use crate::platform_impl::platform::window_state::{
-    CursorFlags, ImeState, WindowFlags, WindowState,
+    CursorFlags, ImeState, SavedWindow, WindowFlags, WindowState,
 };
 use crate::platform_impl::platform::{
     raw_input, util, wrap_device_id, Fullscreen, WindowId, DEVICE_ID,
@@ -901,6 +902,10 @@ pub(crate) static DESTROY_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::Des
 // documentation in the `window_state` module for more information.
 pub(crate) static SET_RETAIN_STATE_ON_SIZE_MSG_ID: LazyMessageId =
     LazyMessageId::new("Winit::SetRetainMaximized\0");
+// Posted by `Window::set_fullscreen(None)` to move the window back to its saved windowed
+// placement in a later message than the one that restored its style. WPARAM and LPARAM are unused.
+pub(crate) static RESTORE_WINDOWED_MSG_ID: LazyMessageId =
+    LazyMessageId::new("Winit::RestoreWindowed\0");
 static THREAD_EVENT_TARGET_WINDOW_CLASS: Lazy<Vec<u16>> =
     Lazy::new(|| util::encode_wide("Winit Thread Event Target"));
 /// When the taskbar is created, it registers a message with the "TaskbarCreated" string and then
@@ -2450,6 +2455,24 @@ unsafe fn public_window_callback_inner(
                 window_state.set_window_flags_in_place(|f| {
                     f.set(WindowFlags::MARKER_RETAIN_STATE_ON_SIZE, wparam != 0)
                 });
+                result = ProcResult::Value(0);
+            } else if msg == RESTORE_WINDOWED_MSG_ID.get() {
+                // The window may have gone fullscreen again before this message arrived; it then
+                // keeps the placement for the next exit.
+                let saved_window = {
+                    let mut window_state = userdata.window_state_lock();
+                    if window_state.fullscreen.is_none() {
+                        window_state.saved_window.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(SavedWindow { placement }) = saved_window {
+                    unsafe {
+                        SetWindowPlacement(window, &placement);
+                        InvalidateRgn(window, 0, false.into());
+                    }
+                }
                 result = ProcResult::Value(0);
             } else if msg == TASKBAR_CREATED.get() {
                 let window_state = userdata.window_state_lock();

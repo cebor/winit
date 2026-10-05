@@ -39,3 +39,8 @@ The migration guide could reference other migration examples in the current
 changelog entry.
 
 ## Unreleased
+
+### Fixed
+
+- On Windows, fix a transparent window turning opaque outside its drawn content after leaving
+  fullscreen.
