@@ -35,13 +35,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMenu, GetSystemMetrics, GetWindowPlacement, GetWindowTextLengthW,
     GetWindowTextW, IsWindowVisible, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassExW,
     SetCursor, SetCursorPos, SetForegroundWindow, SetMenuDefaultItem, SetWindowDisplayAffinity,
-    SetWindowPos, SetWindowTextW, TrackPopupMenu, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    FLASHWINFO, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY, GWLP_HINSTANCE, HTBOTTOM,
-    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
-    MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND, NID_READY, PM_NOREMOVE, SC_CLOSE,
-    SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SM_DIGITIZER, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN, TPM_RETURNCMD, WDA_EXCLUDEFROMCAPTURE,
-    WDA_NONE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WNDCLASSEXW,
+    SetWindowPlacement, SetWindowPos, SetWindowTextW, TrackPopupMenu, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, FLASHWINFO, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY,
+    GWLP_HINSTANCE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
+    HTTOPLEFT, HTTOPRIGHT, MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND, NID_READY,
+    PM_NOREMOVE, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SM_DIGITIZER,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN, TPM_RETURNCMD,
+    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WNDCLASSEXW,
 };
 
 use tracing::warn;
@@ -111,6 +111,17 @@ impl Window {
         self.window_state.lock().unwrap()
     }
 
+    /// Applies a windowed placement that leaving fullscreen left for a later message, so that it
+    /// does not undo a change of position, size or show state requested after it.
+    fn apply_pending_windowed_placement(&self) {
+        let window = self.window;
+        let window_state = Arc::clone(&self.window_state);
+        self.thread_executor.execute_in_thread(move || {
+            let _ = &window;
+            restore_windowed_placement(window, &window_state);
+        });
+    }
+
     pub fn set_title(&self, text: &str) {
         let wide_text = util::encode_wide(text);
         unsafe {
@@ -133,6 +144,7 @@ impl Window {
 
     #[inline]
     pub fn set_visible(&self, visible: bool) {
+        self.apply_pending_windowed_placement();
         let window = self.window;
         let window_state = Arc::clone(&self.window_state);
         self.thread_executor.execute_in_thread(move || {
@@ -185,6 +197,7 @@ impl Window {
 
     #[inline]
     pub fn set_outer_position(&self, position: Position) {
+        self.apply_pending_windowed_placement();
         let (x, y): (i32, i32) = position.to_physical::<i32>(self.scale_factor()).into();
 
         let window_state = Arc::clone(&self.window_state);
@@ -234,6 +247,7 @@ impl Window {
 
     #[inline]
     pub fn request_inner_size(&self, size: Size) -> Option<PhysicalSize<u32>> {
+        self.apply_pending_windowed_placement();
         let scale_factor = self.scale_factor();
         let physical_size = size.to_physical::<u32>(scale_factor);
 
@@ -648,6 +662,7 @@ impl Window {
 
     #[inline]
     pub fn set_minimized(&self, minimized: bool) {
+        self.apply_pending_windowed_placement();
         let window = self.window;
         let window_state = Arc::clone(&self.window_state);
 
@@ -671,6 +686,7 @@ impl Window {
 
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
+        self.apply_pending_windowed_placement();
         let window = self.window;
         let window_state = Arc::clone(&self.window_state);
 
@@ -837,13 +853,15 @@ impl Window {
                     }
                 },
                 None => {
-                    // Move the window back in a later message, not in the one that restored its
-                    // style above. When the style and the bounds change within one message, a
-                    // transparent window stays opaque outside its drawn content afterwards (seen
-                    // with a Vulkan swapchain on NVIDIA); with the style restored first and the
-                    // bounds in a later message, it keeps its transparency.
-                    unsafe {
-                        PostMessageW(window, event_loop::RESTORE_WINDOWED_MSG_ID.get(), 0, 0);
+                    // Restore the windowed bounds in a later message, not in this one, which
+                    // restored the style above. With the style and the bounds changed within one
+                    // message, a transparent window rendered through a Vulkan swapchain on NVIDIA
+                    // stays opaque outside its drawn content until it is recreated.
+                    let posted = unsafe {
+                        PostMessageW(window, event_loop::RESTORE_WINDOWED_MSG_ID.get(), 0, 0)
+                    };
+                    if posted == false.into() {
+                        restore_windowed_placement(window, &window_state);
                     }
                 },
             }
@@ -1498,6 +1516,25 @@ unsafe fn taskbar_mark_fullscreen(handle: HWND, fullscreen: bool) {
         let mark_fullscreen_window = unsafe { (*(*task_bar_list2).lpVtbl).MarkFullscreenWindow };
         unsafe { mark_fullscreen_window(task_bar_list2, handle, fullscreen.into()) };
     })
+}
+
+/// Moves the window back to the windowed placement saved on entering fullscreen, if leaving
+/// fullscreen left that for a later message and the window has not gone fullscreen again since.
+pub(crate) fn restore_windowed_placement(hwnd: HWND, window_state: &Mutex<WindowState>) {
+    let saved_window = {
+        let mut window_state = window_state.lock().unwrap();
+        if window_state.fullscreen.is_some() {
+            return;
+        }
+        window_state.saved_window.take()
+    };
+    // Not under the lock: `SetWindowPlacement` sends messages that lock the window state.
+    if let Some(SavedWindow { placement }) = saved_window {
+        unsafe {
+            SetWindowPlacement(hwnd, &placement);
+            InvalidateRgn(hwnd, 0, false.into());
+        }
+    }
 }
 
 pub(crate) unsafe fn set_skip_taskbar(hwnd: HWND, skip: bool) {
