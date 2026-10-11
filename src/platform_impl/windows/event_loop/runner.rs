@@ -24,10 +24,16 @@ pub(crate) struct EventLoopRunner<T: 'static> {
     // The event loop's win32 handles
     pub(super) thread_msg_target: HWND,
 
-    // Setting this will ensure pump_events will return to the external
-    // loop asap. E.g. set after each RedrawRequested to ensure pump_events
-    // can't stall an external loop beyond a frame
+    // Set after each `RedrawRequested`: `dispatch_peeked_messages` then only paints the other
+    // windows with a pending redraw and returns, so `pump_events` can't stall an external loop
+    // beyond a frame.
     pub(super) interrupt_msg_dispatch: Cell<bool>,
+    // Set while `dispatch_peeked_messages` dispatches a `WM_PAINT`: a redraw the application
+    // requests for that window from its `RedrawRequested` waits in `deferred_redraws` until
+    // every other window with a pending redraw was painted.
+    pub(super) collect_redraws: Cell<bool>,
+    // Windows to request a redraw for once the current paint round ends.
+    pub(super) deferred_redraws: RefCell<Vec<HWND>>,
 
     control_flow: Cell<ControlFlow>,
     exit: Cell<Option<i32>>,
@@ -65,6 +71,8 @@ impl<T> EventLoopRunner<T> {
         EventLoopRunner {
             thread_msg_target,
             interrupt_msg_dispatch: Cell::new(false),
+            collect_redraws: Cell::new(false),
+            deferred_redraws: RefCell::new(Vec::new()),
             runner_state: Cell::new(RunnerState::Uninitialized),
             control_flow: Cell::new(ControlFlow::default()),
             exit: Cell::new(None),
@@ -107,6 +115,8 @@ impl<T> EventLoopRunner<T> {
         let EventLoopRunner {
             thread_msg_target: _,
             interrupt_msg_dispatch,
+            collect_redraws,
+            deferred_redraws,
             runner_state,
             panic_error,
             control_flow: _,
@@ -116,6 +126,8 @@ impl<T> EventLoopRunner<T> {
             event_buffer: _,
         } = self;
         interrupt_msg_dispatch.set(false);
+        collect_redraws.set(false);
+        deferred_redraws.borrow_mut().clear();
         runner_state.set(RunnerState::Uninitialized);
         panic_error.set(None);
         exit.set(None);
@@ -209,8 +221,9 @@ impl<T> EventLoopRunner<T> {
         if let Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } = event {
             self.call_event_handler(event);
             // As a rule, to ensure that `pump_events` can't block an external event loop
-            // for too long, we always guarantee that `pump_events` will return control to
-            // the external loop asap after a `RedrawRequested` event is dispatched.
+            // for too long, after a `RedrawRequested` event is dispatched
+            // `dispatch_peeked_messages` only paints the other windows with a pending redraw,
+            // then returns control.
             self.interrupt_msg_dispatch.set(true);
         } else if self.should_buffer() {
             // If the runner is already borrowed, we're in the middle of an event loop invocation.

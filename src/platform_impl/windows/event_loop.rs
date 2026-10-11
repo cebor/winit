@@ -386,6 +386,13 @@ impl<T: 'static> EventLoop<T> {
     }
 
     /// Dispatch all queued messages via `PeekMessageW`
+    ///
+    /// Win32 hands out `WM_PAINT` for the first window needing paint. A window whose
+    /// `RedrawRequested` requests the next redraw right away (one that redraws every frame)
+    /// therefore used to win every round and kept all other windows from redrawing
+    /// (rust-windowing/winit#3648). A round now paints each window with a pending redraw at most
+    /// once: redraws requested during a window's `RedrawRequested` are deferred until the round
+    /// ends.
     fn dispatch_peeked_messages(&mut self) {
         let runner = &self.window_target.p.runner_shared;
 
@@ -393,8 +400,12 @@ impl<T: 'static> EventLoop<T> {
         // but we also allow dispatching to be interrupted as a means to
         // ensure the `pump_events` won't indefinitely block an external
         // event loop if there are too many pending events. This interrupt
-        // flag will be set after dispatching `RedrawRequested` events.
+        // flag will be set after dispatching `RedrawRequested` events; from then on
+        // only the other windows with a pending redraw are painted.
         runner.interrupt_msg_dispatch.set(false);
+
+        // Windows painted in this round.
+        let mut painted: Vec<HWND> = Vec::new();
 
         // # Safety
         // The Windows API has no documented requirement for bitwise
@@ -404,11 +415,29 @@ impl<T: 'static> EventLoop<T> {
         let mut msg: MSG = unsafe { mem::zeroed() };
 
         loop {
+            // `WM_QUIT` is retrieved regardless of the filter.
+            let (min, max) =
+                if runner.interrupt_msg_dispatch.get() { (WM_PAINT, WM_PAINT) } else { (0, 0) };
+
             unsafe {
-                if PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) == false.into() {
+                if PeekMessageW(&mut msg, 0, min, max, PM_REMOVE) == false.into() {
                     break;
                 }
+            }
 
+            let is_paint = msg.message == WM_PAINT;
+            if is_paint && painted.contains(&msg.hwnd) {
+                // Already painted in this round. `PeekMessageW` may have removed this `WM_PAINT`
+                // (it does for an internal paint), so request it again for the next round.
+                runner.deferred_redraws.borrow_mut().push(msg.hwnd);
+                break;
+            }
+            if is_paint {
+                painted.push(msg.hwnd);
+                runner.collect_redraws.set(true);
+            }
+
+            unsafe {
                 let handled = if let Some(callback) = self.msg_hook.as_deref_mut() {
                     callback(&mut msg as *mut _ as *mut _)
                 } else {
@@ -420,6 +449,8 @@ impl<T: 'static> EventLoop<T> {
                 }
             }
 
+            runner.collect_redraws.set(false);
+
             if let Err(payload) = runner.take_panic_error() {
                 runner.reset_runner();
                 panic::resume_unwind(payload);
@@ -428,10 +459,10 @@ impl<T: 'static> EventLoop<T> {
             if let Some(_code) = runner.exit_code() {
                 break;
             }
+        }
 
-            if runner.interrupt_msg_dispatch.get() {
-                break;
-            }
+        for window in runner.deferred_redraws.take() {
+            unsafe { RedrawWindow(window, ptr::null(), 0, RDW_INTERNALPAINT) };
         }
     }
 
@@ -1278,13 +1309,13 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_PAINT => {
-            userdata.window_state_lock().redraw_requested =
-                userdata.event_loop_runner.should_buffer();
+            let buffered = userdata.event_loop_runner.should_buffer();
+            userdata.window_state_lock().redraw_requested = buffered;
 
             // We'll buffer only in response to `UpdateWindow`, if win32 decides to redraw the
             // window outside the normal flow of the event loop. This way mark event as handled
             // and request a normal redraw with `RedrawWindow`.
-            if !userdata.event_loop_runner.should_buffer() {
+            if !buffered {
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
                     event: WindowEvent::RedrawRequested,
@@ -1297,7 +1328,13 @@ unsafe fn public_window_callback_inner(
             // after marking `WM_PAINT` as handled.
             result = ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
             if std::mem::take(&mut userdata.window_state_lock().redraw_requested) {
-                unsafe { RedrawWindow(window, ptr::null(), 0, RDW_INTERNALPAINT) };
+                if !buffered && userdata.event_loop_runner.collect_redraws.get() {
+                    // Painted from `dispatch_peeked_messages`: request the redraw once the
+                    // other windows with a pending redraw had their turn.
+                    userdata.event_loop_runner.deferred_redraws.borrow_mut().push(window);
+                } else {
+                    unsafe { RedrawWindow(window, ptr::null(), 0, RDW_INTERNALPAINT) };
+                }
             }
         },
         WM_WINDOWPOSCHANGING => {

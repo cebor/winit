@@ -44,3 +44,4 @@ changelog entry.
 
 - On Windows, fix a transparent window turning opaque outside its drawn content after leaving
   fullscreen.
+- On Windows, fix a window that redraws every frame keeping the other windows from redrawing.
